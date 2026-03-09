@@ -41,7 +41,7 @@ const BRAND_WEIGHT = 0.10;
 
 // Soubor indexu na Google Drive (gzip JSON)
 // Změněno jméno souboru, aby se vynutilo přegenerování indexu s novou logikou spec-matching
-const DRIVE_INDEX_FILE = 'PAIRING_INDEX_v10.json.gz';
+const DRIVE_INDEX_FILE = 'PAIRING_INDEX_v11.json.gz';
 
 // Spec matching: bonus za shodu, penalizace za neshodu
 const SPEC_MATCH_BONUS   = 0.15;  // +15% za každý sedící spec
@@ -111,7 +111,7 @@ function runOneBatchInternal(limit, interactive) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const qSheet = ss.getSheetByName(QUERY_SHEET);
   const outSheet = ss.getSheetByName(OUTPUT_SHEET);
-  const outCols = TOP_K * 2;
+  const outCols = TOP_K * 6;
 
   const info = findNextStartRow_();
   if (!info || info.startRow === -1) {
@@ -136,7 +136,7 @@ function findNextStartRow_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const qSheet = ss.getSheetByName(QUERY_SHEET);
   const outSheet = ss.getSheetByName(OUTPUT_SHEET);
-  const outCols = TOP_K * 2;
+  const outCols = TOP_K * 6;
 
   const qLast = qSheet.getLastRow();
   if (qLast < 2) return { startRow: -1 };
@@ -246,9 +246,9 @@ function NajdiShodyTop3(opts = {}) {
 
   // --- Výstup ---
   const outSheet = ss.getSheetByName(OUTPUT_SHEET);
-  const outCols = TOP_K * 2;
+  const outCols = TOP_K * 6;
   const header = [];
-  for (let k = 1; k <= TOP_K; k++) header.push(`Shoda ${k}`, `% ${k}`);
+  for (let k = 1; k <= TOP_K; k++) header.push('Shoda ' + k, 'Celkem ' + k, 'Nazev ' + k, 'Fuzzy ' + k, 'Param ' + k, 'Stav ' + k);
   outSheet.getRange(1, OUTPUT_START_COL, 1, outCols).setValues([header]);
 
   const out = Array.from({ length: qNames.length }, () => Array(outCols).fill(''));
@@ -315,18 +315,28 @@ function NajdiShodyTop3(opts = {}) {
     // 3. Finální skóre (Detailní porovnání)
     const scored = cands.map(id => {
       const r = idx.refItems[id];
-      var base = similarityScore(qp, r);
+      var detail = similarityScoreDetailed(qp, r);
       var bScore = brandMatchScore(qBrandNorm, r.brand);
-
-      // Znacka: aditivni bonus (bez capu — skore muze byt nad 1.0)
-      var final = base + BRAND_WEIGHT * bScore;
-      return { id: id, name: r.display || '', score: final };
+      var final = detail.total + BRAND_WEIGHT * bScore;
+      return {
+        id: id, name: r.display || '', score: final,
+        nameP: detail.nameP, fuzzyP: detail.fuzzyP, paramP: detail.paramP
+      };
     }).sort((a, b) => b.score - a.score).slice(0, TOP_K);
 
     scored.forEach((t, k) => {
-      const base = k * 2;
+      var base = k * 6;
+      var celkem = Math.round((t.score || 0) * 100);
+      var nazev = Math.round((t.nameP || 0) * 100);
+      var fuzzy = Math.round((t.fuzzyP || 0) * 100);
+      var param = t.paramP !== null ? Math.round(t.paramP * 100) : '';
+      var stav = interpretMatch(nazev, fuzzy, t.paramP !== null ? Math.round(t.paramP * 100) : null, celkem);
       out[i][base] = t.name || '';
-      out[i][base + 1] = Math.round((t.score || 0) * 100);
+      out[i][base + 1] = celkem;
+      out[i][base + 2] = nazev;
+      out[i][base + 3] = fuzzy;
+      out[i][base + 4] = param;
+      out[i][base + 5] = stav;
     });
   });
 
@@ -341,7 +351,7 @@ function buildOrLoadIndex(refVals, oldVals, brandsNormArr = []) {
   const first = (refVals[0] || '').slice(0, 32);
   const N = refVals.length;
   // Zmena verze => vynuti pregenerovani indexu (normalize: carka, split cislo/pismeno)
-  const version = `v10-PLUS_SIGN|N=${N}|F=${first}`;
+  const version = `v11-DETAILED_SCORING|N=${N}|F=${first}`;
 
   const fromDrive = loadIndexFromDrive();
   if (fromDrive && fromDrive.version === version) return fromDrive;
@@ -456,12 +466,18 @@ function preprocessName(str, idx) {
   var tri = charTrigrams(norm);
   var num = extractNumbersWithUnits(norm);
   var specs = extractSpecs(norm);
+  // nameToks: tokeny bez cisel a jednotek — cista shoda nazvu/kodu
+  var nameNorm = norm
+    .replace(/\d+(?:\.\d+)?\s*(?:ml|l|kg|g|mm|cm|m\s*3|m|kw|w|ks|pack|bal)\b/g, '')
+    .replace(/\b\d+(?:\.\d+)?\b/g, '')
+    .replace(/\s+/g, ' ').trim();
+  var nameToks = tokens(nameNorm);
   // sizeVal zachovan pro zpetnou kompatibilitu (coarse scoring)
   var sizeVal = null;
   for (var i = 0; i < specs.length; i++) {
     if (specs[i].category === 'volume' || specs[i].category === 'weight') { sizeVal = specs[i].baseVal; break; }
   }
-  return { idx: idx, norm: norm, toks: toks, tri: tri, num: num, specs: specs, sizeVal: sizeVal };
+  return { idx: idx, norm: norm, toks: toks, tri: tri, num: num, specs: specs, sizeVal: sizeVal, nameToks: nameToks };
 }
 
 function weightTokensByIDF(toks, idf) {
@@ -487,8 +503,8 @@ function extractSpecs(str) {
   var specs = {};
   var m;
 
-  // Prutok/vykon ventilatoru: 1300m3, 1300m3/h
-  var flowRe = /(\d+(?:\.\d+)?)\s*m3(?:\/h)?\b/g;
+  // Prutok/vykon ventilatoru: 1300m3, 1300 m 3, 1300m3/h
+  var flowRe = /(\d+(?:\.\d+)?)\s*m\s*3(?:\s*\/\s*h)?\b/g;
   while ((m = flowRe.exec(raw)) !== null) {
     specs['flow'] = parseFloat(m[1]);
   }
@@ -536,35 +552,79 @@ function extractNormalizedSize(str) {
   return null;
 }
 
-/***** ====== VÝPOČET SKÓRE PODOBNOSTI (V2 — BEZ CAPU) ====== *****/
+/***** ====== VÝPOČET SKÓRE PODOBNOSTI (V3 — DETAILNÍ) ====== *****/
 
 /**
- * Skore = (text_score x spec_penalties) + spec_bonusy
- * - text_score: 0-1.0 (cosine trigramy 60% + jaccard tokeny 40%)
- * - spec_penalties: za kazdou nesedici specifikaci nasobi x0.2
- * - spec_bonusy: za kazdou sedici specifikaci prida +0.15
- * Vysledek NENI capovany na 1.0 — muze byt nad 100%.
+ * Vraci objekt s detailnimi slozkami:
+ *   total    — celkove skore (bez capu, muze byt nad 1.0)
+ *   nameP    — shoda nazvu/kodu 0-1 (jaccard na tokenech bez cisel)
+ *   fuzzyP   — fuzzy shoda textu 0-1 (cosine na trigramech)
+ *   paramP   — shoda parametru 0-1, nebo null pokud zadne specs k porovnani
  */
-function similarityScore(a, b) {
-  // 1. Textova podobnost (zaklad 0-1.0)
-  var cos = cosineSim(freq(a.tri), freq(b.tri));
-  var jac = jaccard(a.toks, b.toks);
-  var score = 0.6 * cos + 0.4 * jac;
+function similarityScoreDetailed(a, b) {
+  // 1. Nazev: Jaccard na tokenech bez cisel/jednotek
+  var nameP = jaccard(a.nameToks || [], b.nameToks || []);
 
-  // 2. Spec matching: porovname vsechny sdilene kategorie
+  // 2. Fuzzy: Cosine na trigramech (plny text vcetne cisel)
+  var fuzzyP = cosineSim(freq(a.tri), freq(b.tri));
+
+  // 3. Parametry: podil sedících specs
   var specResult = compareSpecs(a.specs || [], b.specs || []);
-  // Penalizace: za kazdou nesedici spec nasobime skore (tvrdy trest)
+  var totalSpecs = specResult.matches + specResult.mismatches;
+  var paramP = totalSpecs > 0 ? (specResult.matches / totalSpecs) : null;
+
+  // 4. Celkove skore: text zaklad + spec bonusy/penalty
+  var textScore = 0.6 * fuzzyP + 0.4 * jaccard(a.toks, b.toks);
+  var total = textScore;
   for (var p = 0; p < specResult.mismatches; p++) {
-    score *= SPEC_MISMATCH_MULT;
+    total *= SPEC_MISMATCH_MULT;
   }
-  // Bonusy: za kazdou sedici spec pridame body (muze jit nad 1.0)
-  score += specResult.matches * SPEC_MATCH_BONUS;
+  total += specResult.matches * SPEC_MATCH_BONUS;
 
-  // 3. Stary ciselny bonus pro ostatni cisla (ks, pack, x) — maly vliv
+  // Stary ciselny bonus (ks, pack, x)
   var oldNumBonus = numberUnitBonus(a.num, b.num);
-  score += 0.05 * oldNumBonus;
+  total += 0.05 * oldNumBonus;
 
-  return Math.max(0, score); // bez horni hranice!
+  return {
+    total: Math.max(0, total),
+    nameP: nameP,
+    fuzzyP: fuzzyP,
+    paramP: paramP
+  };
+}
+
+/**
+ * Interpretace shody na zaklade komponent.
+ * nameP, fuzzyP, paramP: 0-100 (procenta), paramP muze byt null.
+ * totalP: celkove procento.
+ */
+function interpretMatch(nameP, fuzzyP, paramP, totalP) {
+  if (totalP < 15) return 'Nenalezeno';
+  if (nameP < 40 && fuzzyP < 50) return 'Neshoda';
+
+  // Parametry nejsou k dispozici
+  if (paramP === null) {
+    if (nameP >= 80 && fuzzyP >= 80) return 'Shoda bez parametru';
+    if (nameP >= 60 && fuzzyP >= 70) return 'Pravdepodobna shoda';
+    if (nameP >= 40 && fuzzyP >= 60) return 'Slaba shoda';
+    return 'Neshoda';
+  }
+
+  // Vsechno sedi
+  if (nameP >= 80 && fuzzyP >= 80 && paramP >= 80) return 'Jista shoda';
+  if (nameP >= 60 && fuzzyP >= 70 && paramP >= 80) return 'Pravdepodobna shoda';
+
+  // Nazev nesedi ale parametry ano
+  if (nameP < 60 && fuzzyP >= 60 && paramP >= 80) return 'Zkontroluj nazev';
+
+  // Nazev sedi ale parametry ne
+  if (nameP >= 60 && fuzzyP >= 60 && paramP < 50) return 'Zkontroluj parametry';
+  if (nameP >= 40 && fuzzyP >= 60 && paramP < 50) return 'Mozna varianta';
+
+  // Nic jasne nesedi
+  if (nameP < 60 && fuzzyP < 70) return 'Slaba shoda';
+
+  return 'Slaba shoda';
 }
 
 /**
@@ -670,7 +730,7 @@ function VymazVystup() {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(OUTPUT_SHEET);
   const rows = Math.max(0, sh.getLastRow() - 1);
-  const cols = TOP_K * 2;
+  const cols = TOP_K * 6;
   if (rows > 0) sh.getRange(2, OUTPUT_START_COL, rows, cols).clearContent();
 }
 
@@ -739,15 +799,20 @@ function DebugRow(row = 2) {
 
   var scored = cands.map(function(id){
       var r = refItems[id];
-      var base = similarityScore(qp, r);
+      var detail = similarityScoreDetailed(qp, r);
       var bScore = brandMatchScore(qBrandNorm, r.brand);
-      var final = base + BRAND_WEIGHT*bScore;
-      return { id: id, name: (r.display||''), score: final, specs: r.specs, brand: r.brand };
+      var final = detail.total + BRAND_WEIGHT*bScore;
+      var celkem = Math.round(final*100);
+      var nazev = Math.round(detail.nameP*100);
+      var fuzzy = Math.round(detail.fuzzyP*100);
+      var param = detail.paramP !== null ? Math.round(detail.paramP*100) : null;
+      return { id: id, name: (r.display||''), celkem: celkem, nazev: nazev, fuzzy: fuzzy, param: param,
+        stav: interpretMatch(nazev, fuzzy, param, celkem), brand: r.brand };
     })
-    .sort(function(a,b){ return b.score-a.score; }).slice(0,5);
+    .sort(function(a,b){ return b.celkem-a.celkem; }).slice(0,5);
 
   console.log('--- TOP 5 VYSLEDKU PRO RADEK ' + row + ' ---');
   scored.forEach(function(s) {
-    console.log('Skore: ' + (s.score*100).toFixed(1) + '% | Produkt: "' + s.name + '" | Specs: ' + JSON.stringify(s.specs) + ' | Znacka: ' + s.brand);
+    console.log('Celkem: ' + s.celkem + '% | Nazev: ' + s.nazev + '% | Fuzzy: ' + s.fuzzy + '% | Param: ' + (s.param !== null ? s.param + '%' : 'N/A') + ' | Stav: ' + s.stav + ' | "' + s.name + '" | Znacka: ' + s.brand);
   });
 }

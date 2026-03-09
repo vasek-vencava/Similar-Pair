@@ -137,6 +137,13 @@ function SizeSortV1SortByMeasuredValue(colIndex, hasHeader, ascending, startColI
   });
 
   keyed.sort(function(a, b) {
+    // Prazdne radky vzdy nakonec
+    var aEmpty = !a.keyText && a.keyNum === null;
+    var bEmpty = !b.keyText && b.keyNum === null;
+    if (aEmpty && bEmpty) return 0;
+    if (aEmpty) return 1;
+    if (bEmpty) return -1;
+
     var textCmp = a.keyText.localeCompare(b.keyText, 'cs', { sensitivity: 'base' });
     if (textCmp !== 0) return textCmp;
 
