@@ -40,8 +40,12 @@ const NUMERIC_BONUS_CAND = 150;
 const BRAND_WEIGHT = 0.10;
 
 // Soubor indexu na Google Drive (gzip JSON)
-// Změněno jméno souboru, aby se vynutilo přegenerování indexu s novou logikou velikostí
-const DRIVE_INDEX_FILE = 'PAIRING_INDEX_v7_SIZE_AWARE.json.gz';
+// Změněno jméno souboru, aby se vynutilo přegenerování indexu s novou logikou spec-matching
+const DRIVE_INDEX_FILE = 'PAIRING_INDEX_v10.json.gz';
+
+// Spec matching: bonus za shodu, penalizace za neshodu
+const SPEC_MATCH_BONUS   = 0.15;  // +15% za každý sedící spec
+const SPEC_MISMATCH_MULT = 0.2;   // ×0.2 za každý nesedící spec (tvrdá penalizace)
 
 // Auto-pokračování
 const MAX_RUN_MS = 5.5 * 60 * 1000;
@@ -311,12 +315,12 @@ function NajdiShodyTop3(opts = {}) {
     // 3. Finální skóre (Detailní porovnání)
     const scored = cands.map(id => {
       const r = idx.refItems[id];
-      const base = similarityScore(qp, r); // Zde je integrována logika velikosti!
-      const bScore = brandMatchScore(qBrandNorm, r.brand);
-      
-      // Váha značky
-      const final = Math.min(1, base + BRAND_WEIGHT * bScore);
-      return { id, name: r.display || '', score: final };
+      var base = similarityScore(qp, r);
+      var bScore = brandMatchScore(qBrandNorm, r.brand);
+
+      // Znacka: aditivni bonus (bez capu — skore muze byt nad 1.0)
+      var final = base + BRAND_WEIGHT * bScore;
+      return { id: id, name: r.display || '', score: final };
     }).sort((a, b) => b.score - a.score).slice(0, TOP_K);
 
     scored.forEach((t, k) => {
@@ -336,8 +340,8 @@ function NajdiShodyTop3(opts = {}) {
 function buildOrLoadIndex(refVals, oldVals, brandsNormArr = []) {
   const first = (refVals[0] || '').slice(0, 32);
   const N = refVals.length;
-  // Změna verze => vynutí přegenerování indexu s novou logikou "sizeVal"
-  const version = `v7-SIZE_LOGIC_INTEGRATED|N=${N}|F=${first}`;
+  // Zmena verze => vynuti pregenerovani indexu (normalize: carka, split cislo/pismeno)
+  const version = `v10-PLUS_SIGN|N=${N}|F=${first}`;
 
   const fromDrive = loadIndexFromDrive();
   if (fromDrive && fromDrive.version === version) return fromDrive;
@@ -447,16 +451,17 @@ function applySynonyms(str, synMap) {
 }
 
 function preprocessName(str, idx) {
-  const norm = normalize(str);
-  const toks = tokens(norm);
-  const tri = charTrigrams(norm);
-  const num = extractNumbersWithUnits(norm);
-  
-  // == INTEGRACE ZE SCRIPTU A ==
-  // Získáme normalizovanou velikost (např. 1000 pro 1kg nebo 1l)
-  const sizeVal = extractNormalizedSize(norm);
-  
-  return { idx, norm, toks, tri, num, sizeVal };
+  var norm = normalize(str);
+  var toks = tokens(norm);
+  var tri = charTrigrams(norm);
+  var num = extractNumbersWithUnits(norm);
+  var specs = extractSpecs(norm);
+  // sizeVal zachovan pro zpetnou kompatibilitu (coarse scoring)
+  var sizeVal = null;
+  for (var i = 0; i < specs.length; i++) {
+    if (specs[i].category === 'volume' || specs[i].category === 'weight') { sizeVal = specs[i].baseVal; break; }
+  }
+  return { idx: idx, norm: norm, toks: toks, tri: tri, num: num, specs: specs, sizeVal: sizeVal };
 }
 
 function weightTokensByIDF(toks, idf) {
@@ -464,78 +469,126 @@ function weightTokensByIDF(toks, idf) {
   return uniq.map(t => [t, idf[t] || 0]).sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
 }
 
-/***** ====== LOGIKA VELIKOSTI (INTEGROVÁNO ZE SCRIPTU A) ====== *****/
+/***** ====== EXTRAKCE SPECIFIKACÍ (ROZŠÍŘENÁ LOGIKA) ====== *****/
 
 /**
- * Převzato ze "SizeSortV1": Najde poslední relevantní rozměr a převede na base unit.
- * Vrací číslo nebo null.
- * Base: objem -> ml, váha -> g, délka -> mm
+ * Extrahuje všechny měřitelné specifikace z názvu produktu.
+ * Vrací pole objektů { category, baseVal } seskupených podle kategorie:
+ *   - "volume"  : ml, l           -> normalizováno na ml
+ *   - "weight"  : g, kg           -> normalizováno na g
+ *   - "length"  : mm, cm, m       -> normalizováno na mm
+ *   - "flow"    : m3, m3/h        -> normalizováno na m3
+ *   - "power"   : w, kw           -> normalizováno na W
+ * Kazda kategorie se vyskytne max jednou (posledni vyskyt vyhraje).
  */
-function extractNormalizedSize(str) {
-  if (!str) return null;
-  const raw = String(str).toLowerCase().trim();
+function extractSpecs(str) {
+  if (!str) return [];
+  var raw = String(str).toLowerCase().replace(/,/g, '.').trim();
+  var specs = {};
+  var m;
 
-  // Regex hledá číslo + jednotku (ml, l, kg, g, mm, cm, m)
-  // Stejný jako ve Scriptu A
-  const re = /(\d+(?:[.,]\d+)?)\s*(ml|l|kg|g|mm|cm|m)\b/g;
-  let match, last = null;
-  while ((match = re.exec(raw)) !== null) {
-    last = match;
+  // Prutok/vykon ventilatoru: 1300m3, 1300m3/h
+  var flowRe = /(\d+(?:\.\d+)?)\s*m3(?:\/h)?\b/g;
+  while ((m = flowRe.exec(raw)) !== null) {
+    specs['flow'] = parseFloat(m[1]);
   }
-  if (!last) return null;
 
-  const val = parseFloat(last[1].replace(',', '.'));
-  const unit = last[2];
-
-  if (!Number.isFinite(val)) return null;
-
-  switch (unit) {
-    case 'ml': return val;
-    case 'l':  return val * 1000;
-    case 'g':  return val;
-    case 'kg': return val * 1000;
-    case 'mm': return val;
-    case 'cm': return val * 10;
-    case 'm':  return val * 1000;
-    default:   return null;
+  // Vykon: 150w, 1.5kw
+  var powerRe = /(\d+(?:\.\d+)?)\s*(kw|w)\b/g;
+  while ((m = powerRe.exec(raw)) !== null) {
+    var val = parseFloat(m[1]);
+    specs['power'] = m[2] === 'kw' ? val * 1000 : val;
   }
-}
 
-/***** ====== VÝPOČET SKÓRE PODOBNOSTI ====== *****/
+  // Objem, vaha, delka
+  var sizeRe = /(\d+(?:\.\d+)?)\s*(ml|l|kg|g|mm|cm|m)\b/g;
+  while ((m = sizeRe.exec(raw)) !== null) {
+    var sVal = parseFloat(m[1]);
+    var unit = m[2];
+    if (!Number.isFinite(sVal)) continue;
 
-function similarityScore(a, b) {
-  // 1. Textová podobnost
-  const cos = cosineSim(freq(a.tri), freq(b.tri));
-  const jac = jaccard(a.toks, b.toks);
-  
-  // Vážené textové skóre
-  let score = 0.6 * cos + 0.4 * jac; 
-
-  // 2. INTEGRACE SIZE LOGIC
-  // Pokud oba mají detekovanou velikost (např. 500ml a 0.5l)
-  if (a.sizeVal !== null && b.sizeVal !== null) {
-    // Poměr velikostí
-    const ratio = a.sizeVal / b.sizeVal;
-    
-    // Pokud jsou si velmi blízké (tolerance 5%)
-    if (ratio > 0.95 && ratio < 1.05) {
-      // VELKÁ VÁHA PRO SHODU: Přičteme výrazný bonus
-      // Tímto "přebijeme" menší rozdíly v názvu
-      score += 0.4; 
-    } else {
-      // VELKÁ VÁHA PRO NESHODU: Výrazná penalizace
-      // Pokud je jeden 100ml a druhý 500ml, je to jiný produkt, i kdyby se jmenoval stejně.
-      score *= 0.2; 
+    switch (unit) {
+      case 'ml': specs['volume'] = sVal; break;
+      case 'l':  specs['volume'] = sVal * 1000; break;
+      case 'g':  specs['weight'] = sVal; break;
+      case 'kg': specs['weight'] = sVal * 1000; break;
+      case 'mm': specs['length'] = sVal; break;
+      case 'cm': specs['length'] = sVal * 10; break;
+      case 'm':
+        if (!specs['flow']) specs['length'] = sVal * 1000;
+        break;
     }
   }
-  // Pokud velikost chybí (u jednoho nebo obou), spoléháme se jen na text + starý numBonus (níže)
 
-  // 3. Starý číselný bonus pro ostatní čísla (kódy, kusy v balení, které Script A neřeší)
-  // Použijeme jen malý vliv, protože hlavní velikost už jsme vyřešili výše
-  const oldNumBonus = numberUnitBonus(a.num, b.num); 
+  var result = [];
+  for (var cat in specs) {
+    result.push({ category: cat, baseVal: specs[cat] });
+  }
+  return result;
+}
+
+/** Zpetna kompatibilita: vraci sizeVal jako drive (pro coarse scoring). */
+function extractNormalizedSize(str) {
+  var specs = extractSpecs(str);
+  for (var i = 0; i < specs.length; i++) {
+    if (specs[i].category === 'volume' || specs[i].category === 'weight') return specs[i].baseVal;
+  }
+  return null;
+}
+
+/***** ====== VÝPOČET SKÓRE PODOBNOSTI (V2 — BEZ CAPU) ====== *****/
+
+/**
+ * Skore = (text_score x spec_penalties) + spec_bonusy
+ * - text_score: 0-1.0 (cosine trigramy 60% + jaccard tokeny 40%)
+ * - spec_penalties: za kazdou nesedici specifikaci nasobi x0.2
+ * - spec_bonusy: za kazdou sedici specifikaci prida +0.15
+ * Vysledek NENI capovany na 1.0 — muze byt nad 100%.
+ */
+function similarityScore(a, b) {
+  // 1. Textova podobnost (zaklad 0-1.0)
+  var cos = cosineSim(freq(a.tri), freq(b.tri));
+  var jac = jaccard(a.toks, b.toks);
+  var score = 0.6 * cos + 0.4 * jac;
+
+  // 2. Spec matching: porovname vsechny sdilene kategorie
+  var specResult = compareSpecs(a.specs || [], b.specs || []);
+  // Penalizace: za kazdou nesedici spec nasobime skore (tvrdy trest)
+  for (var p = 0; p < specResult.mismatches; p++) {
+    score *= SPEC_MISMATCH_MULT;
+  }
+  // Bonusy: za kazdou sedici spec pridame body (muze jit nad 1.0)
+  score += specResult.matches * SPEC_MATCH_BONUS;
+
+  // 3. Stary ciselny bonus pro ostatni cisla (ks, pack, x) — maly vliv
+  var oldNumBonus = numberUnitBonus(a.num, b.num);
   score += 0.05 * oldNumBonus;
 
-  return Math.max(0, Math.min(1, score));
+  return Math.max(0, score); // bez horni hranice!
+}
+
+/**
+ * Porovna specs dvou produktu.
+ * Vraci { matches, mismatches } — pocet kategorii kde se shodly/neshodly.
+ * Kategorie ktera chybi u jednoho z produktu se ignoruje (neni match ani mismatch).
+ */
+function compareSpecs(specsA, specsB) {
+  var mapA = {};
+  for (var i = 0; i < specsA.length; i++) mapA[specsA[i].category] = specsA[i].baseVal;
+  var mapB = {};
+  for (var j = 0; j < specsB.length; j++) mapB[specsB[j].category] = specsB[j].baseVal;
+
+  var matches = 0, mismatches = 0;
+  for (var cat in mapA) {
+    if (!(cat in mapB)) continue; // kategorie chybi u druheho — ignorujeme
+    var ratio = mapA[cat] / mapB[cat];
+    if (ratio > 0.95 && ratio < 1.05) {
+      matches++;
+    } else {
+      mismatches++;
+    }
+  }
+  return { matches: matches, mismatches: mismatches };
 }
 
 
@@ -544,7 +597,14 @@ function safeStr(v){ return (v==null)?'':String(v); }
 function joinClean(parts){ return parts.filter(Boolean).join(' ').replace(/\s+/g,' ').trim(); }
 function normalize(s){
   return safeStr(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .replace(/[^\p{L}\p{N}\s.%×x\-\/]/gu,' ').replace(/\s+/g,' ').trim();
+    // carka jako desetinny oddelovac: "0,5" -> "0.5" (pred odstranenim nepovolených znaku)
+    .replace(/(\d),(\d)/g, '$1.$2')
+    // "+" je soucasti nazvu produktu (Q240+ vs Q240 = jiny produkt)
+    .replace(/[^\p{L}\p{N}\s.%×x\-\/+]/gu,' ')
+    // rozdelit cisla od pismen: "16pot" -> "16 pot", "easy2grow" -> "easy 2 grow"
+    .replace(/(\d)([a-z])/gi, '$1 $2')
+    .replace(/([a-z])(\d)/gi, '$1 $2')
+    .replace(/\s+/g,' ').trim();
 }
 const STOPWORDS = new Set(['a','i','u','v','ve','s','se','z','ze','k','ke','o','do','na','za','pro','bez','od','pod','nad','po']);
 function tokens(s){
@@ -665,30 +725,29 @@ function DebugRow(row = 2) {
   const qp = preprocessName(applySynonyms(qComb, idx.synonymMap), -1);
   const qBrandNorm = normalize(qBrand);
 
-  console.log(`DebugRow ${row}`);
-  console.log(`Dotaz: "${qComb}"`);
-  console.log(`Velikost (sizeVal): ${qp.sizeVal}`);
-  console.log(`Tokeny: ${JSON.stringify(qp.toks)}`);
+  console.log('DebugRow ' + row);
+  console.log('Dotaz: "' + qComb + '"');
+  console.log('Specs: ' + JSON.stringify(qp.specs));
+  console.log('Tokeny: ' + JSON.stringify(qp.toks));
 
-  const tk = weightTokensByIDF(qp.toks, idx.idf).slice(0, Math.max(3, Math.ceil(qp.toks.length*0.6)));
-  const testToken = tk[0];
-  
-  // Simulace výběru kandidátů (zjednodušeně pro debug)
-  const refItems = idx.refItems;
-  let cands = (idxGet(idx.tokenIndex, testToken)||[]).slice(0,100); // jen vzorek
-  if (cands.length === 0) cands = [0,1,2,3,4]; // fallback
+  var tk = weightTokensByIDF(qp.toks, idx.idf).slice(0, Math.max(3, Math.ceil(qp.toks.length*0.6)));
+  var testToken = tk[0];
 
-  const scored = cands.map(id=>{
-      const r = refItems[id];
-      const base = similarityScore(qp, r);
-      const bScore = brandMatchScore(qBrandNorm, r.brand);
-      const final = Math.min(1, base + BRAND_WEIGHT*bScore);
-      return { id, name: (r.display||''), score: final, rSize: r.sizeVal, rBrand: r.brand };
+  var refItems = idx.refItems;
+  var cands = (idxGet(idx.tokenIndex, testToken)||[]).slice(0,100);
+  if (cands.length === 0) cands = [0,1,2,3,4];
+
+  var scored = cands.map(function(id){
+      var r = refItems[id];
+      var base = similarityScore(qp, r);
+      var bScore = brandMatchScore(qBrandNorm, r.brand);
+      var final = base + BRAND_WEIGHT*bScore;
+      return { id: id, name: (r.display||''), score: final, specs: r.specs, brand: r.brand };
     })
-    .sort((a,b)=>b.score-a.score).slice(0,5);
+    .sort(function(a,b){ return b.score-a.score; }).slice(0,5);
 
-  console.log(`--- TOP 5 VÝSLEDKŮ PRO ŘÁDEK ${row} ---`);
-  scored.forEach(s => {
-    console.log(`Skóre: ${(s.score*100).toFixed(1)}% | Produkt: "${s.name}" | Velikost DB: ${s.rSize} | Značka DB: ${s.rBrand}`);
+  console.log('--- TOP 5 VYSLEDKU PRO RADEK ' + row + ' ---');
+  scored.forEach(function(s) {
+    console.log('Skore: ' + (s.score*100).toFixed(1) + '% | Produkt: "' + s.name + '" | Specs: ' + JSON.stringify(s.specs) + ' | Znacka: ' + s.brand);
   });
 }

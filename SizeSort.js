@@ -1,195 +1,184 @@
-/******************************* //// https://chatgpt.com/share/e/691307d8-5b30-800b-b22f-226b14261bd2
- * SizeSortV1 – JEDEN SOUBOR
- * - Menu: Řazení dle veličiny → Seřadit…
- * - Dialog: výběr sloupce, "má hlavičku", směr řazení
- * - Řazení: nejprve podle názvu (text bez čísla+jednotky), uvnitř podle normalizované hodnoty
- * - Podporované jednotky: ml/l, g/kg, mm/cm/m
+/*******************************
+ * SizeSortV1
+ * - Menu: Seradit...
+ * - Prompt dialog (bez HTML - nevyzaduje OAuth showModalDialog)
+ * - Razeni: nejprve podle nazvu (text bez cisla+jednotky), uvnitr podle normalizovane hodnoty
+ * - Podporovane jednotky: ml/l, g/kg, mm/cm/m
  *******************************/
 
-
-
-/** Otevře dialog (HTML je inline ve stringu) */
+/** Otevre prompt dialog pro vyber sloupce a spusti razeni */
 function SizeSortV1OpenSortDialog() {
-  const SizeSortV1Html = `
-<!DOCTYPE html>
-<html>
-  <head>
-    <base target="_top">
-    <meta charset="UTF-8">
-    <style>
-      body { font-family: Arial, sans-serif; padding: 14px; }
-      label { display:block; margin-top:10px; }
-      .SizeSortV1Row { display:flex; gap:10px; align-items:center; }
-      .SizeSortV1Actions { margin-top:16px; display:flex; gap:10px; }
-      select, input[type="checkbox"], input[type="radio"] { font-size:14px; }
-      h3 { margin:0 0 8px 0; }
-    </style>
-  </head>
- <body>
-    <h3>Seřadit list podle veličiny</h3>
+  var ui = SpreadsheetApp.getUi();
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var lastCol = sheet.getLastColumn();
 
-    <label>Sloupec k řazení:</label>
-    <div class="SizeSortV1Row">
-      <select id="SizeSortV1Col"></select>
-      <span id="SizeSortV1ColLabel"></span>
-    </div>
+  // 1. Ma hlavicku?
+  var headerResponse = ui.alert(
+    'Hlavicka',
+    'Ma list hlavicku (prvni radek)?',
+    ui.ButtonSet.YES_NO_CANCEL
+  );
+  if (headerResponse === ui.Button.CANCEL) return;
+  var hasHeader = (headerResponse === ui.Button.YES);
 
-    <label class="SizeSortV1Row">
-      <input type="checkbox" id="SizeSortV1HasHeader" checked>
-      Má list hlavičku (první řádek)?
-    </label>
-     <label>Směr řazení:</label>
-    <div class="SizeSortV1Row">
-      <label class="SizeSortV1Row"><input type="radio" name="SizeSortV1Dir" value="asc" checked> Vzestupně</label>
-      <label class="SizeSortV1Row"><input type="radio" name="SizeSortV1Dir" value="desc"> Sestupně</label>
-    </div>
+  // 2. Rozsah sloupcu k razeni (ktere sloupce se maji presouvat)
+  var rangeResponse = ui.prompt(
+    'Rozsah sloupcu',
+    'Ktere sloupce seradit? (napr. A:G nebo A-G)\nPrazdne = vsechny sloupce.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (rangeResponse.getSelectedButton() !== ui.Button.OK) return;
 
-    <div class="SizeSortV1Actions">
-      <button onclick="SizeSortV1RunSort()">Seřadit</button>
-      <button onclick="google.script.host.close()">Zavřít</button>
-    </div>
+  var rangeInput = rangeResponse.getResponseText().trim().toUpperCase();
+  var startColIdx = 1;
+  var endColIdx = lastCol;
 
-    <script>
-      function SizeSortV1ColIndexToLetter(n){
-        let s = '';
-        while(n>0){
-          let r = (n-1)%26;
-          s = String.fromCharCode(65+r) + s;
-          n = Math.floor((n-1)/26);
-        }
-        return s;
-      }
-      function SizeSortV1InitColumnsCount(count){
-        const sel = document.getElementById('SizeSortV1Col');
-        sel.innerHTML = '';
-        for (let i=1; i<=count; i++){
-          const opt = document.createElement('option');
-          opt.value = i;
-          opt.textContent = SizeSortV1ColIndexToLetter(i) + ' (' + i + ')';
-          sel.appendChild(opt);
-        }
-        SizeSortV1UpdateLabel();
-        sel.addEventListener('change', SizeSortV1UpdateLabel);
-      }
-      function SizeSortV1UpdateLabel(){
-        const sel = document.getElementById('SizeSortV1Col');
-        const idx = parseInt(sel.value,10);
-        document.getElementById('SizeSortV1ColLabel').textContent = 'Vybrán: ' + (isNaN(idx)?'—': (idx + ' [' + SizeSortV1ColIndexToLetter(idx) + ']'));
-      }
-      function SizeSortV1RunSort(){
-        const SizeSortV1Col = parseInt(document.getElementById('SizeSortV1Col').value,10);
-        const SizeSortV1HasHeader = document.getElementById('SizeSortV1HasHeader').checked;
-        const SizeSortV1Dir = document.querySelector('input[name="SizeSortV1Dir"]:checked').value;
-        const SizeSortV1Ascending = (SizeSortV1Dir === 'asc');
-        if (!SizeSortV1Col || SizeSortV1Col < 1){
-          alert('Vyber sloupec.');
-          return;
-        }
-        google.script.run
-          .withSuccessHandler(() => google.script.host.close())
-          .SizeSortV1SortByMeasuredValue(SizeSortV1Col, SizeSortV1HasHeader, SizeSortV1Ascending);
-      }
-      google.script.run.withSuccessHandler(SizeSortV1InitColumnsCount).SizeSortV1GetActiveSheetColumnCount();
-    </script>
-  </body>
-</html>
-  `;
-  const SizeSortV1Dialog = HtmlService.createHtmlOutput(SizeSortV1Html)
-    .setWidth(440)
-    .setHeight(300);
-  SpreadsheetApp.getUi().showModalDialog(SizeSortV1Dialog, 'Seřadit list podle veličiny');
+  if (rangeInput) {
+    var parts = rangeInput.split(/[\s:\-]+/);
+    if (parts.length >= 2) {
+      var p1 = parseInt(parts[0], 10);
+      var p2 = parseInt(parts[1], 10);
+      startColIdx = isNaN(p1) ? SizeSortV1LetterToColIndex(parts[0]) : p1;
+      endColIdx = isNaN(p2) ? SizeSortV1LetterToColIndex(parts[1]) : p2;
+    } else if (parts.length === 1) {
+      var p = parseInt(parts[0], 10);
+      endColIdx = isNaN(p) ? SizeSortV1LetterToColIndex(parts[0]) : p;
+    }
+
+    if (!startColIdx || !endColIdx || startColIdx < 1 || endColIdx < 1 || startColIdx > endColIdx) {
+      ui.alert('Neplatny rozsah sloupcu: ' + rangeResponse.getResponseText());
+      return;
+    }
+  }
+
+  // 3. Vyber sloupec k razeni
+  var colResponse = ui.prompt(
+    'Sloupec k razeni',
+    'Podle ktereho sloupce seradit? (pismeno nebo cislo, napr. B nebo 2)\nRozsah: ' + SizeSortV1ColIndexToLetter(startColIdx) + ':' + SizeSortV1ColIndexToLetter(endColIdx),
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (colResponse.getSelectedButton() !== ui.Button.OK) return;
+
+  var colInput = colResponse.getResponseText().trim().toUpperCase();
+  var colIndex = parseInt(colInput, 10);
+  if (isNaN(colIndex)) {
+    colIndex = SizeSortV1LetterToColIndex(colInput);
+  }
+  if (!colIndex || colIndex < 1 || colIndex > lastCol) {
+    ui.alert('Neplatny sloupec: ' + colResponse.getResponseText());
+    return;
+  }
+
+  // 4. Smer razeni
+  var dirResponse = ui.alert(
+    'Smer razeni',
+    'Vzestupne (Ano) nebo Sestupne (Ne)?',
+    ui.ButtonSet.YES_NO
+  );
+  var ascending = (dirResponse === ui.Button.YES);
+
+  // Spustit razeni
+  SizeSortV1SortByMeasuredValue(colIndex, hasHeader, ascending, startColIdx, endColIdx);
 }
 
-/** Počet sloupců aktivního listu (pro dialog) */
-function SizeSortV1GetActiveSheetColumnCount() {
-  const SizeSortV1Sheet = SpreadsheetApp.getActiveSheet();
-  return SizeSortV1Sheet.getLastColumn();
+/** Prevod pismena sloupce na cislo: A=1, B=2, ..., Z=26, AA=27 */
+function SizeSortV1LetterToColIndex(letter) {
+  if (!letter || !/^[A-Z]+$/.test(letter)) return NaN;
+  var result = 0;
+  for (var i = 0; i < letter.length; i++) {
+    result = result * 26 + (letter.charCodeAt(i) - 64);
+  }
+  return result;
+}
+
+/** Prevod cisla sloupce na pismeno: 1=A, 2=B, ..., 27=AA */
+function SizeSortV1ColIndexToLetter(n) {
+  var s = '';
+  while (n > 0) {
+    var r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
 }
 
 /**
- * Hlavní řazení – hierarchicky: název → velikost
- * @param {number} SizeSortV1ColumnIndex 1 = A, 2 = B, ...
- * @param {boolean} SizeSortV1HasHeader true = první řádek je hlavička
- * @param {boolean} SizeSortV1Ascending true = vzestupně, false = sestupně
+ * Hlavni razeni - hierarchicky: nazev -> velikost
+ * startColIdx/endColIdx urcuji rozsah sloupcu ktere se presouvaji (default vsechny)
  */
-function SizeSortV1SortByMeasuredValue(SizeSortV1ColumnIndex, SizeSortV1HasHeader, SizeSortV1Ascending) {
-  const SizeSortV1Sheet = SpreadsheetApp.getActiveSheet();
-  const SizeSortV1LastRow = SizeSortV1Sheet.getLastRow();
-  const SizeSortV1LastCol = SizeSortV1Sheet.getLastColumn();
-  if (SizeSortV1LastRow < 2) return;
+function SizeSortV1SortByMeasuredValue(colIndex, hasHeader, ascending, startColIdx, endColIdx) {
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var lastRow = sheet.getLastRow();
+  if (!startColIdx) startColIdx = 1;
+  if (!endColIdx) endColIdx = sheet.getLastColumn();
+  if (lastRow < 2) return;
+  if (colIndex < startColIdx || colIndex > endColIdx) {
+    SpreadsheetApp.getUi().alert('Sloupec k razeni (' + SizeSortV1ColIndexToLetter(colIndex) + ') neni v rozsahu ' + SizeSortV1ColIndexToLetter(startColIdx) + ':' + SizeSortV1ColIndexToLetter(endColIdx));
+    return;
+  }
 
-  const SizeSortV1StartRow = SizeSortV1HasHeader ? 2 : 1;
-  const SizeSortV1NumRows = SizeSortV1LastRow - SizeSortV1StartRow + 1;
+  var startRow = hasHeader ? 2 : 1;
+  var numRows = lastRow - startRow + 1;
+  var numCols = endColIdx - startColIdx + 1;
 
-  const SizeSortV1All = SizeSortV1Sheet.getRange(SizeSortV1StartRow, 1, SizeSortV1NumRows, SizeSortV1LastCol).getValues();
-  const SizeSortV1KeyIndex = SizeSortV1ColumnIndex - 1;
+  var all = sheet.getRange(startRow, startColIdx, numRows, numCols).getValues();
+  // keyIdx relativne k rozsahu
+  var keyIdx = colIndex - startColIdx;
 
-  const SizeSortV1Keyed = SizeSortV1All.map((SizeSortV1Row) => {
-    const SizeSortV1CellText = (SizeSortV1Row[SizeSortV1KeyIndex] ?? '').toString().toLowerCase().trim();
-    const SizeSortV1NormVal = SizeSortV1NormalizeToBaseUnit(SizeSortV1CellText);
-    // název = text bez „číslo+jednotka“ (bere poslední výskyt pro hodnotu, ale tady pro název odstraníme VŠECHNY výskyty)
-    const SizeSortV1NameText = SizeSortV1CellText.replace(/(\d+(?:[.,]\d+)?\s*(ml|l|kg|g|mm|cm|m)\b)/gi, '').replace(/[,-]+$/,'').trim();
+  var keyed = all.map(function(row) {
+    var cellText = (row[keyIdx] == null ? '' : String(row[keyIdx])).toLowerCase().trim();
+    var normVal = SizeSortV1NormalizeToBaseUnit(cellText);
+    var nameText = cellText.replace(/(\d+(?:[.,]\d+)?\s*(ml|l|kg|g|mm|cm|m)\b)/gi, '').replace(/[,-]+$/, '').trim();
     return {
-      SizeSortV1KeyText: SizeSortV1NameText,
-      SizeSortV1KeyNum: Number.isFinite(SizeSortV1NormVal) ? SizeSortV1NormVal : null,
-      SizeSortV1Row
+      keyText: nameText,
+      keyNum: Number.isFinite(normVal) ? normVal : null,
+      row: row
     };
   });
 
-  SizeSortV1Keyed.sort((a, b) => {
-    const SizeSortV1TextCmp = a.SizeSortV1KeyText.localeCompare(b.SizeSortV1KeyText, 'cs', {sensitivity:'base'});
-    if (SizeSortV1TextCmp !== 0) return SizeSortV1TextCmp; // různé názvy
+  keyed.sort(function(a, b) {
+    var textCmp = a.keyText.localeCompare(b.keyText, 'cs', { sensitivity: 'base' });
+    if (textCmp !== 0) return textCmp;
 
-    const SizeSortV1A = a.SizeSortV1KeyNum, SizeSortV1B = b.SizeSortV1KeyNum;
-    if (SizeSortV1A === null && SizeSortV1B === null) return 0;
-    if (SizeSortV1A === null) return 1;
-    if (SizeSortV1B === null) return -1;
-    return SizeSortV1Ascending ? (SizeSortV1A - SizeSortV1B) : (SizeSortV1B - SizeSortV1A);
+    var aNum = a.keyNum, bNum = b.keyNum;
+    if (aNum === null && bNum === null) return 0;
+    if (aNum === null) return 1;
+    if (bNum === null) return -1;
+    return ascending ? (aNum - bNum) : (bNum - aNum);
   });
 
-  const SizeSortV1Sorted = SizeSortV1Keyed.map(x => x.SizeSortV1Row);
-  SizeSortV1Sheet.getRange(SizeSortV1StartRow, 1, SizeSortV1Sorted.length, SizeSortV1LastCol).setValues(SizeSortV1Sorted);
-  SpreadsheetApp.getActive().toast('Řazení hotovo');
+  var sorted = keyed.map(function(x) { return x.row; });
+  sheet.getRange(startRow, startColIdx, sorted.length, numCols).setValues(sorted);
+  SpreadsheetApp.getActive().toast('Razeni hotovo');
 }
 
 /**
- * Normalizace textu do základní jednotky:
- * - objem → ml (l * 1000)
- * - hmotnost → g (kg * 1000)
- * - délka → mm (m * 1000, cm * 10)
- * Vrací Number nebo NaN, pokud nic nenajde.
+ * Normalizace textu do zakladni jednotky:
+ * objem -> ml, hmotnost -> g, delka -> mm
  */
-function SizeSortV1NormalizeToBaseUnit(SizeSortV1Value) {
-  if (SizeSortV1Value == null) return NaN;
-  const SizeSortV1Raw = String(SizeSortV1Value).toLowerCase().trim();
+function SizeSortV1NormalizeToBaseUnit(value) {
+  if (value == null) return NaN;
+  var raw = String(value).toLowerCase().trim();
 
-  // Najdi POSLEDNÍ výskyt: číslo (+ desetinná tečka/čárka) + volitelná mezera + jednotka
-  const SizeSortV1Re = /(\d+(?:[.,]\d+)?)\s*(ml|l|kg|g|mm|cm|m)\b/g;
-  let SizeSortV1Match, SizeSortV1Last = null;
-  while ((SizeSortV1Match = SizeSortV1Re.exec(SizeSortV1Raw)) !== null) {
-    SizeSortV1Last = SizeSortV1Match;
+  var re = /(\d+(?:[.,]\d+)?)\s*(ml|l|kg|g|mm|cm|m)\b/g;
+  var match, last = null;
+  while ((match = re.exec(raw)) !== null) {
+    last = match;
   }
-  if (!SizeSortV1Last) return NaN;
+  if (!last) return NaN;
 
-  const SizeSortV1Num = parseFloat(SizeSortV1Last[1].replace(',', '.'));
-  const SizeSortV1Unit = SizeSortV1Last[2];
+  var num = parseFloat(last[1].replace(',', '.'));
+  var unit = last[2];
+  if (!Number.isFinite(num)) return NaN;
 
-  if (!Number.isFinite(SizeSortV1Num)) return NaN;
-
-  switch (SizeSortV1Unit) {
-    // OBJEM -> ml
-    case 'ml': return SizeSortV1Num;
-    case 'l':  return SizeSortV1Num * 1000;
-
-    // HMOTNOST -> g
-    case 'g':  return SizeSortV1Num;
-    case 'kg': return SizeSortV1Num * 1000;
-
-    // DÉLKA -> mm
-    case 'mm': return SizeSortV1Num;
-    case 'cm': return SizeSortV1Num * 10;
-    case 'm':  return SizeSortV1Num * 1000;
-
+  switch (unit) {
+    case 'ml': return num;
+    case 'l':  return num * 1000;
+    case 'g':  return num;
+    case 'kg': return num * 1000;
+    case 'mm': return num;
+    case 'cm': return num * 10;
+    case 'm':  return num * 1000;
     default:   return NaN;
   }
 }
